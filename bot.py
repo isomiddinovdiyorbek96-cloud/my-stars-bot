@@ -3,23 +3,16 @@ import sys
 import logging
 import asyncio
 from typing import Dict, List, Set
-from dotenv import load_dotenv, set_key
-
+import aiohttp
 from aiohttp import web
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ChatAction, ParseMode
-from aiogram.utils.chat_action import ChatActionSender
 
-ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-load_dotenv(ENV_PATH)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
-# Adminlar ro'yxatini yuklash
 def load_admin_ids() -> Set[int]:
     raw = os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", "")).strip()
     clean_raw = raw.replace("'", "").replace('"', "")
@@ -32,103 +25,86 @@ def load_admin_ids() -> Set[int]:
 
 admin_ids = load_admin_ids()
 
-def save_admin_ids():
-    global admin_ids
-    raw_str = ",".join(str(i) for i in sorted(admin_ids))
-    try:
-        set_key(ENV_PATH, "ADMIN_IDS", raw_str)
-        set_key(ENV_PATH, "ADMIN_ID", raw_str)
-        logger.info(f"Adminlar saqlandi: {raw_str}")
-    except Exception as e:
-        logger.error(f"Adminlarni saqlashda xato: {e}")
-
-ADMIN_SECRET = "777"
-
-# Loglar
-log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
-handlers = [logging.FileHandler(log_file, encoding="utf-8")]
-if sys.stdout is not None:
-    handlers.append(logging.StreamHandler(sys.stdout))
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=handlers
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("StarsBot")
-
-# OpenAI
-openai_client = None
-if OPENAI_API_KEY:
-    try:
-        from openai import AsyncOpenAI
-        openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        logger.error(f"OpenAI yuklashda xato: {e}")
-
-# Gemini (Tezkor Gemini 3.8 Flash)
-gemini_model = None
-if GEMINI_API_KEY:
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        # Tezkor javob berish uchun parametrlar
-        generation_config = {
-            "temperature": 0.4,
-            "top_p": 0.9,
-            "max_output_tokens": 1500,
-        }
-        gemini_model = genai.GenerativeModel("gemini-3.8-flash", generation_config=generation_config)
-    except Exception as e:
-        logger.error(f"Gemini yuklashda xato: {e}")
 
 user_histories: Dict[int, List[dict]] = {}
 
 def is_owner(user_id: int) -> bool:
     global admin_ids
-    if len(admin_ids) < 3 and user_id not in admin_ids:
-        admin_ids.add(user_id)
-        save_admin_ids()
+    if not admin_ids:
         return True
     return user_id in admin_ids
 
-async def ask_ai(user_id: int, user_message: str) -> str:
-    """Maksimal tezlikda aniq javob olish"""
-    global openai_client, gemini_model
+http_session: aiohttp.ClientSession = None
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global http_session
+    if http_session is None or http_session.closed:
+        timeout = aiohttp.ClientTimeout(total=25)
+        http_session = aiohttp.ClientSession(timeout=timeout)
+    return http_session
+
+async def ask_gemini_direct(user_id: int, user_message: str) -> str:
+    session = await get_http_session()
     
-    # 1. Google Gemini (Serverda 1 soniyada javob beradi)
-    if (AI_PROVIDER == "gemini" or not openai_client) and gemini_model:
-        try:
-            # Tez va lo'nda javob talabi
-            prompt = (
-                f"Savol: {user_message}\n\n"
-                f"Talab: Javobni iloji boricha tez, aniq, lo'nda va to'liq qilib bering. "
-                f"Ortiqcha salom-alik yoki cho'zilgan gaplarsiz, to'g'ridan-to'g'ri masalaning aniq javobini yozing."
-            )
-            response = await asyncio.to_thread(gemini_model.generate_content, prompt)
-            ai_reply = response.text or "Javob topilmadi."
-            return ai_reply.strip()
-        except Exception as e:
-            logger.error(f"Gemini xatosi: {e}")
-            return f"⚠️ Xatolik: {str(e)[:120]}"
+    if user_id not in user_histories:
+        user_histories[user_id] = []
+    history = user_histories[user_id]
 
-    # 2. OpenAI
-    if openai_client:
-        try:
-            response = await openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Aniq, lo'nda va tezkor javob bering."},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.3,
-                max_tokens=1500,
-            )
-            return (response.choices[0].message.content or "Javob yo'q.").strip()
-        except Exception as e:
-            return f"⚠️ OpenAI xatosi: {str(e)[:120]}"
+    contents = []
+    for item in history[-6:]:
+        contents.append({
+            "role": item["role"],
+            "parts": [{"text": item["text"]}]
+        })
+    contents.append({
+        "role": "user",
+        "parts": [{"text": user_message}]
+    })
 
-    return "⚠️ AI kaliti kiritilmagan."
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    payload = {
+        "contents": contents,
+        "systemInstruction": {
+            "parts": [{
+                "text": (
+                    "Siz o'ta tezkor, aqlli va qisqa javob beruvchi yordamchisiz. "
+                    "Foydalanuvchining savoliga darhol, lo'nda, aniq va to'liq javob bering. "
+                    "Ortiqcha kirish yoki cho'zilgan gaplar yozmang, to'g'ridan-to'g'ri asosiy javobni bering. "
+                    "Oldingi savol-javoblar kontekstini doimo inobatga oling."
+                )
+            }]
+        },
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 800
+        }
+    }
+
+    try:
+        async with session.post(url, json=payload) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                ai_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                history.append({"role": "user", "text": user_message})
+                history.append({"role": "model", "text": ai_text})
+                user_histories[user_id] = history[-6:]
+                return ai_text
+            else:
+                fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
+                async with session.post(fallback_url, json=payload) as fb_resp:
+                    if fb_resp.status == 200:
+                        fb_data = await fb_resp.json()
+                        return fb_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return "⚠️ Xatolik yuz berdi."
+    except Exception as e:
+        logger.error(f"Xato: {e}")
+        return "⚠️ Aloqada kechikish bo'ldi, qayta yozing."
 
 async def send_split_message(message: types.Message, text: str):
     max_len = 4000
@@ -152,47 +128,31 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-@dp.message(Command("admin"))
-@dp.message(Command("login"))
-async def cmd_login(message: types.Message):
-    global admin_ids
-    user_id = message.from_user.id
-    parts = message.text.split()
-    if len(parts) > 1 and parts[1] == ADMIN_SECRET:
-        admin_ids.add(user_id)
-        save_admin_ids()
-        await message.answer(f"✅ Muvaffaqiyatli admin bo'ldingiz! (ID: {user_id})")
-        return
-    if not is_owner(user_id):
-        return
-    await message.answer(f"Siz adminsiz! Adminlar: {len(admin_ids)}")
-
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    if not is_owner(user_id):
-        return  # Begonalarga jim o'tiradi
-    
-    await message.answer(
-        "👋 Salom! Bot 24/7 tezkor rejimda faol.\n"
-        "🔒 Begonalarga mutlaqo jim turadi.\n"
-        "💬 Istalgan savolingizni yozing, tezkor javob beraman!"
-    )
+    if not is_owner(message.from_user.id):
+        return
+    await message.answer("⚡ Bot 24/7 tezkor rejimda faol! Savolingizni yozing:")
+
+@dp.message(Command("clear"))
+async def cmd_clear(message: types.Message):
+    if not is_owner(message.from_user.id):
+        return
+    user_histories[message.from_user.id] = []
+    await message.answer("🧹 Xotira tozalandi.")
 
 @dp.message(F.text)
 async def handle_user_message(message: types.Message):
     user_id = message.from_user.id
     if not is_owner(user_id):
-        return  # Begonalarga hech narsa demaydi!
+        return
 
-    async with ChatActionSender(bot=bot, chat_id=message.chat.id, action=ChatAction.TYPING):
-        response = await ask_ai(user_id, message.text.strip())
-    
-    await send_split_message(message, response)
+    asyncio.create_task(bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING))
+    reply_text = await ask_gemini_direct(user_id, message.text.strip())
+    await send_split_message(message, reply_text)
 
-# Render / Bulutli serverlar uchun Ping Health Check veb-serveri
 async def handle_health_check(request):
-    return web.Response(text="Stars Bot 24/7 ishlamoqda!")
+    return web.Response(text="Bot is running ultra-fast 24/7!")
 
 async def start_web_server():
     app = web.Application()
@@ -200,15 +160,29 @@ async def start_web_server():
     app.router.add_get("/health", handle_health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Health-check server {port}-portda ishga tushdi.")
+    logger.info(f"Health-check server {port}-portda ishlamoqda.")
+
+async def keep_alive_loop():
+    external_url = os.getenv("RENDER_EXTERNAL_URL") or "https://my-stars-bot-v9kl.onrender.com"
+    health_url = f"{external_url}/health"
+    await asyncio.sleep(20)
+    
+    while True:
+        try:
+            session = await get_http_session()
+            async with session.get(health_url, timeout=10) as resp:
+                logger.info(f"Keep-alive ping: {resp.status}")
+        except Exception:
+            pass
+        await asyncio.sleep(480)
 
 async def main():
-    logger.info(f"Bot 24/7 ishga tushmoqda. Adminlar: {admin_ids}")
-    # Render / Cloud serverlar uchun veb-serverni parallel yoqish
+    logger.info(f"Ultra-tezkor bot ishga tushmoqda. Adminlar: {admin_ids}")
     await start_web_server()
+    asyncio.create_task(keep_alive_loop())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
